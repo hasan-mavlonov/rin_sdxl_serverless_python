@@ -1,13 +1,19 @@
-FROM registry.runpod.io/pytorch/pytorch:2.1.2-py3.10-cuda12.1
+FROM python:3.10-slim
 
-# Install OS dependencies
-RUN apt-get update && apt-get install -y git
+# Install system dependencies
+RUN apt-get update && apt-get install -y git wget libgl1 libglib2.0-0
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+# Install PyTorch with CUDA 12.1 (CPU fallback is automatic on serverless)
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install diffusers + accelerate + transformers
+RUN pip install diffusers==0.27.2 transformers accelerate safetensors pillow
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r requirements.txt
 
 COPY . /app
 
