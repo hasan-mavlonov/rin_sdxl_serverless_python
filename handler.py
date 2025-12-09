@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 import runpod
 import torch
-from diffusers import StableDiffusionImg2ImgPipeline
+from diffusers import AutoPipelineForImage2Image
 from PIL import Image
 
 # Determine device and dtype once
@@ -12,9 +12,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
 # Load the pipeline globally to avoid reloading per request
-pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/sdxl-turbo",
-    torch_dtype=DTYPE,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
 ).to(DEVICE)
 
 
