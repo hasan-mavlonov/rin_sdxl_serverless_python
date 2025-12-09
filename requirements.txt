@@ -5,4 +5,4 @@ accelerate==0.28.0
 safetensors
 pillow
 huggingface_hub>=0.23.2
-peft
+peft==0.8.2
