@@ -26,9 +26,8 @@ pipe = AutoPipelineForImage2Image.from_pretrained(
 
 print("Loaded SDXL Base img2img pipeline.")
 
-
 # -------------------------------------------------------
-# Optional LoRA loading (if you want later)
+# Optional LoRA loading
 # -------------------------------------------------------
 LORA_DIR = "/app/lora" if os.path.exists("/app/lora") else "lora"
 LORA_NAME = "rinxl_lora.safetensors"
@@ -57,6 +56,7 @@ def decode_image(b64: str) -> Image.Image:
     raw = base64.b64decode(b64)
     img = Image.open(io.BytesIO(raw))
 
+    # Remove alpha to avoid weird artifacts / NaNs
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
@@ -73,6 +73,29 @@ def encode_image(img: Image.Image) -> str:
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def _fix_size(img: Image.Image) -> Image.Image:
+    """
+    Ensure the image size is valid for SDXL:
+    - width & height >= 512
+    - divisible by 8
+    This prevents 'tensor of 0 elements' reshape errors.
+    """
+    w, h = img.size
+
+    # Just in case something is really broken
+    if w <= 0 or h <= 0:
+        w, h = 512, 512
+
+    w = max(512, (w // 8) * 8)
+    h = max(512, (h // 8) * 8)
+
+    if (w, h) != img.size:
+        print(f"[handler] Resizing input image from {img.size} to {(w, h)} for SDXL.")
+        img = img.resize((w, h), Image.LANCZOS)
+
+    return img
 
 
 # -------------------------------------------------------
@@ -102,8 +125,8 @@ def handler(event: Dict[str, Any]):
     if not image_b64:
         return {"error": "Missing base64 image"}
 
-    # SAFE DEFAULTS (fixing black image problem)
-    strength = float(inp.get("strength", 0.08))  # SAFE RANGE
+    # SAFE DEFAULTS (help avoid black images)
+    strength = float(inp.get("strength", 0.08))  # low-strength refinement
     strength = _clamp(strength, 0.02, 0.15)
 
     steps = int(inp.get("steps", 12))
@@ -123,24 +146,29 @@ def handler(event: Dict[str, Any]):
     except Exception as exc:
         return {"error": f"Failed to decode input image: {exc}"}
 
+    # 🔧 Fix size for SDXL (prevents 0-element tensor reshape)
+    img = _fix_size(img)
+
     # Init seed
     generator = None
     if seed is not None:
         try:
             generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
         except Exception:
-            pass
+            generator = None
 
     # Activate LoRA (if exists)
     if HAS_LORA:
         pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
 
     # -------------------------------------------------------
-    # Inference (NO MORE NaNs / black output)
+    # Inference
     # -------------------------------------------------------
     try:
+        autocast_dtype = torch.float16 if DEVICE == "cuda" else torch.bfloat16
+
         with torch.inference_mode(), torch.autocast(
-            "cuda", dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16
+            device_type=DEVICE, dtype=autocast_dtype
         ):
             result = pipe(
                 prompt=prompt,
@@ -152,6 +180,7 @@ def handler(event: Dict[str, Any]):
             )
 
         out_img = result.images[0]
+
         return {
             "refined_image": encode_image(out_img),
             "meta": {
@@ -161,11 +190,12 @@ def handler(event: Dict[str, Any]):
                 "lora_scale": lora_scale,
                 "seed": seed,
                 "device": DEVICE,
-                "used_lora": HAS_LORA
-            }
+                "used_lora": HAS_LORA,
+            },
         }
 
     except Exception as exc:
+        # If something still goes wrong, you see the exact message in RunPod logs
         return {"error": f"Pipeline failed: {exc}"}
 
 
