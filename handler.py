@@ -1,7 +1,7 @@
 import base64
 import io
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import runpod
 import torch
@@ -21,7 +21,7 @@ print("Device:", DEVICE, "dtype:", DTYPE)
 pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
     torch_dtype=DTYPE,
-    use_safetensors=True
+    use_safetensors=True,
 ).to(DEVICE)
 
 print("Loaded SDXL Base img2img pipeline.")
@@ -34,19 +34,41 @@ LORA_NAME = "rinxl_lora.safetensors"
 ADAPTER_NAME = "rin_adapter"
 
 lora_path = os.path.join(LORA_DIR, LORA_NAME)
-HAS_LORA = os.path.exists(lora_path)
+HAS_LORA = False
 
-if HAS_LORA:
-    print(f"Loading LoRA adapter from {lora_path}")
-    pipe.load_lora_weights(
-        LORA_DIR,
-        weight_name=LORA_NAME,
-        adapter_name=ADAPTER_NAME
-    )
-    pipe.set_adapters([ADAPTER_NAME], adapter_weights=[1.0])
-    print("LoRA loaded.")
-else:
-    print("WARNING: No LoRA found, running without.")
+
+def _log(msg: str) -> None:
+    """Lightweight logger for RunPod."""
+    print(f"[handler] {msg}")
+
+
+def _load_lora_adapter() -> bool:
+    """Attempt to load the LoRA adapter; return True if active."""
+    global HAS_LORA
+
+    if not os.path.exists(lora_path):
+        _log(f"LoRA not found at {lora_path}; proceeding without adapter.")
+        return False
+
+    try:
+        _log(f"Loading LoRA adapter from {lora_path}")
+        pipe.load_lora_weights(
+            LORA_DIR,
+            weight_name=LORA_NAME,
+            adapter_name=ADAPTER_NAME,
+        )
+        # Pre-warm by setting a very small weight to validate dimensions.
+        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[0.01])
+        HAS_LORA = True
+        _log("LoRA adapter loaded and validated.")
+    except Exception as exc:
+        HAS_LORA = False
+        _log(f"Failed to load LoRA: {exc}. Running without it.")
+
+    return HAS_LORA
+
+
+_load_lora_adapter()
 
 
 # -------------------------------------------------------
@@ -75,14 +97,75 @@ def _clamp(v, lo, hi):
 
 
 def _fix_size(img: Image.Image) -> Image.Image:
-    """Prevent SDXL empty tensor crash."""
+    """Normalize SDXL input size to multiples of 8 and at least 512."""
     w, h = img.size
     w = max(512, (w // 8) * 8)
     h = max(512, (h // 8) * 8)
     if (w, h) != img.size:
-        print(f"[handler] Resizing input image from {img.size} to {(w, h)}")
+        _log(f"Resizing input image from {img.size} to {(w, h)}")
         img = img.resize((w, h), Image.LANCZOS)
     return img
+
+
+def _safe_generator(seed: Optional[int]) -> Optional[torch.Generator]:
+    if seed is None:
+        return None
+    try:
+        return torch.Generator(device=DEVICE).manual_seed(int(seed))
+    except Exception:
+        _log(f"Invalid seed provided ({seed}); using random seed.")
+        return None
+
+
+def _nan_check_callback(pipe, step, timestep, callback_kwargs):
+    latents = callback_kwargs.get("latents")
+    if latents is not None and not torch.isfinite(latents).all():
+        raise ValueError("Non-finite values detected in latents during diffusion")
+    return callback_kwargs
+
+
+def _disable_lora_if_present():
+    if hasattr(pipe, "disable_lora"):
+        pipe.disable_lora()
+    elif hasattr(pipe, "set_adapters"):
+        try:
+            pipe.set_adapters([], adapter_weights=[])
+        except Exception:
+            pass
+
+
+def _run_pipeline(
+    prompt: str,
+    img: Image.Image,
+    strength: float,
+    steps: int,
+    guidance_scale: float,
+    generator: Optional[torch.Generator],
+    lora_scale: float,
+    use_lora: bool,
+):
+    if HAS_LORA and use_lora:
+        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
+        _log(f"Running with LoRA scale {lora_scale}")
+    else:
+        _disable_lora_if_present()
+        _log("Running without LoRA")
+
+    autocast_dtype = torch.float16 if DEVICE == "cuda" else torch.bfloat16
+
+    with torch.inference_mode(), torch.autocast(device_type=DEVICE, dtype=autocast_dtype):
+        result = pipe(
+            prompt=prompt,
+            image=img,
+            strength=strength,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            callback_on_step_end=_nan_check_callback,
+            callback_on_step_end_tensor_inputs=["latents"],
+        )
+
+    return result.images[0]
 
 
 # -------------------------------------------------------
@@ -97,18 +180,22 @@ def handler(event: Dict[str, Any]):
     if not image_b64:
         return {"error": "Missing base64 image"}
 
-    # 🔥 FINAL FIX: SDXL cannot run below ~0.25
     strength = float(inp.get("strength", 0.35))
-    strength = _clamp(strength, 0.25, 0.55)
+    # Safe range for SDXL img2img strength
+    strength = _clamp(strength, 0.25, 0.6)
 
     steps = int(inp.get("steps", 18))
     steps = max(10, min(steps, 50))
 
     guidance_scale = float(inp.get("guidance_scale", 4.0))
-    guidance_scale = _clamp(guidance_scale, 1.0, 6.0)
+    guidance_scale = _clamp(guidance_scale, 1.0, 7.5)
 
-    lora_scale = float(inp.get("lora_scale", 1.0))
-    lora_scale = _clamp(lora_scale, 0.0, 2.0)
+    requested_lora_scale = float(inp.get("lora_scale", 1.0))
+    safe_lora_scale = _clamp(requested_lora_scale, 0.0, 1.25)
+    if safe_lora_scale != requested_lora_scale:
+        _log(
+            f"LoRA scale {requested_lora_scale} is high; clamped to safe value {safe_lora_scale}."
+        )
 
     seed = inp.get("seed")
 
@@ -119,45 +206,51 @@ def handler(event: Dict[str, Any]):
 
     img = _fix_size(img)
 
-    generator = None
-    if seed is not None:
-        try:
-            generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
-        except Exception:
-            generator = None
+    generator = _safe_generator(seed)
 
-    if HAS_LORA:
-        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
-
+    # First attempt: with LoRA if available and requested scale > 0
+    use_lora = HAS_LORA and safe_lora_scale > 0
     try:
-        autocast_dtype = torch.float16 if DEVICE == "cuda" else torch.bfloat16
-        with torch.inference_mode(), torch.autocast(device_type=DEVICE, dtype=autocast_dtype):
-            result = pipe(
-                prompt=prompt,
-                image=img,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator
-            )
-
-        out_img = result.images[0]
-
-        return {
-            "refined_image": encode_image(out_img),
-            "meta": {
-                "strength": strength,
-                "steps": steps,
-                "guidance_scale": guidance_scale,
-                "lora_scale": lora_scale,
-                "seed": seed,
-                "device": DEVICE,
-                "used_lora": HAS_LORA
-            }
-        }
-
+        out_img = _run_pipeline(
+            prompt=prompt,
+            img=img,
+            strength=strength,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            lora_scale=safe_lora_scale,
+            use_lora=use_lora,
+        )
     except Exception as exc:
-        return {"error": f"Pipeline failed: {exc}"}
+        _log(f"Pipeline failed with LoRA ({exc}); retrying without LoRA.")
+        # Retry without LoRA to avoid returning empty images
+        try:
+            out_img = _run_pipeline(
+                prompt=prompt,
+                img=img,
+                strength=strength,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                lora_scale=0.0,
+                use_lora=False,
+            )
+            use_lora = False
+        except Exception as inner_exc:
+            return {"error": f"Pipeline failed without LoRA: {inner_exc}"}
+
+    return {
+        "refined_image": encode_image(out_img),
+        "meta": {
+            "strength": strength,
+            "steps": steps,
+            "guidance_scale": guidance_scale,
+            "lora_scale": safe_lora_scale,
+            "seed": seed,
+            "device": DEVICE,
+            "used_lora": HAS_LORA and use_lora,
+        },
+    }
 
 
 runpod.serverless.start({"handler": handler})
