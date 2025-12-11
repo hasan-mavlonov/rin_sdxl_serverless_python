@@ -8,54 +8,24 @@ import torch
 from diffusers import AutoPipelineForImage2Image
 from PIL import Image
 
-# -------------------------------
-# Device & dtypes
-# -------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-
 print("Device:", DEVICE, "dtype:", DTYPE)
 
-# -------------------------------
-# LoRA paths & adapter name
-# -------------------------------
-LORA_DIR = "/app/lora" if os.path.exists("/app/lora") else "lora"
-LORA_NAME = "rinxl_lora.safetensors"
-ADAPTER_NAME = "rinxl"
-
-lora_path = os.path.join(LORA_DIR, LORA_NAME)
-if not os.path.exists(lora_path):
-    raise FileNotFoundError(f"LoRA missing: {lora_path}")
-
-# -------------------------------
-# Load SDXL BASE + LoRA (dynamic adapter)
-# -------------------------------
+# --- SDXL BASE, NO LORA ---
 pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
     torch_dtype=DTYPE,
     use_safetensors=True,
 ).to(DEVICE)
 
-print(f"Loading LoRA from {lora_path} with adapter '{ADAPTER_NAME}'")
-pipe.load_lora_weights(
-    LORA_DIR,
-    weight_name=LORA_NAME,
-    adapter_name=ADAPTER_NAME,
-)
-
-# enable adapter with default scale 1.0
-pipe.set_adapters([ADAPTER_NAME], adapter_weights=[1.0])
-print("LoRA loaded on SDXL Base as dynamic adapter.")
+print("Loaded SDXL Base img2img WITHOUT LoRA.")
 
 
-# -------------------------------
-# Helpers
-# -------------------------------
 def decode_image(b64: str) -> Image.Image:
     raw = base64.b64decode(b64)
     img = Image.open(io.BytesIO(raw))
 
-    # Handle Gemini PNGs with alpha to avoid black artifacts
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
@@ -74,25 +44,7 @@ def _clamp(val: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, val))
 
 
-# -------------------------------
-# Handler
-# -------------------------------
 def handler(event: Dict[str, Any]):
-    """
-    Expected input shape:
-
-    {
-      "input": {
-        "prompt": "text prompt",
-        "image": "<base64 PNG/JPEG>",
-        "strength": 0.25,
-        "steps": 20,
-        "guidance_scale": 4.5,
-        "lora_scale": 0.85,
-        "seed": 123
-      }
-    }
-    """
     inp = event.get("input") or {}
 
     prompt: str = inp.get("prompt", "")
@@ -103,7 +55,6 @@ def handler(event: Dict[str, Any]):
     if not image_b64:
         return {"error": "Missing base64 image in 'input.image'"}
 
-    # SDXL Base prefers a bit more steps + guidance than Turbo
     try:
         strength = float(inp.get("strength", 0.25))
     except Exception:
@@ -121,12 +72,6 @@ def handler(event: Dict[str, Any]):
     except Exception:
         guidance_scale = 4.5
 
-    try:
-        lora_scale = float(inp.get("lora_scale", 0.85))
-    except Exception:
-        lora_scale = 0.85
-    lora_scale = _clamp(lora_scale, 0.0, 2.0)
-
     seed = inp.get("seed")
 
     try:
@@ -142,9 +87,6 @@ def handler(event: Dict[str, Any]):
             generator = None
 
     try:
-        # dynamic LoRA strength per request
-        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
-
         with torch.inference_mode(), torch.autocast(
             device_type=DEVICE,
             dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16,
@@ -165,10 +107,9 @@ def handler(event: Dict[str, Any]):
                 "strength": strength,
                 "steps": steps,
                 "guidance_scale": guidance_scale,
-                "lora_scale": lora_scale,
                 "seed": seed,
                 "device": DEVICE,
-                "adapter_name": ADAPTER_NAME,
+                "adapter_name": None,
             },
         }
     except Exception as e:
