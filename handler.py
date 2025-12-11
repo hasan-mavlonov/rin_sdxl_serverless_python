@@ -16,7 +16,7 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 print("Device:", DEVICE, "dtype:", DTYPE)
 
 # -------------------------------------------------------
-# Load SDXL Base (correct model for LoRA)
+# Load SDXL Base
 # -------------------------------------------------------
 pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
@@ -56,7 +56,6 @@ def decode_image(b64: str) -> Image.Image:
     raw = base64.b64decode(b64)
     img = Image.open(io.BytesIO(raw))
 
-    # Remove alpha to avoid weird artifacts / NaNs
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
@@ -76,25 +75,13 @@ def _clamp(v, lo, hi):
 
 
 def _fix_size(img: Image.Image) -> Image.Image:
-    """
-    Ensure the image size is valid for SDXL:
-    - width & height >= 512
-    - divisible by 8
-    This prevents 'tensor of 0 elements' reshape errors.
-    """
+    """Prevent SDXL empty tensor crash."""
     w, h = img.size
-
-    # Just in case something is really broken
-    if w <= 0 or h <= 0:
-        w, h = 512, 512
-
     w = max(512, (w // 8) * 8)
     h = max(512, (h // 8) * 8)
-
     if (w, h) != img.size:
-        print(f"[handler] Resizing input image from {img.size} to {(w, h)} for SDXL.")
+        print(f"[handler] Resizing input image from {img.size} to {(w, h)}")
         img = img.resize((w, h), Image.LANCZOS)
-
     return img
 
 
@@ -102,54 +89,36 @@ def _fix_size(img: Image.Image) -> Image.Image:
 # MAIN HANDLER
 # -------------------------------------------------------
 def handler(event: Dict[str, Any]):
-    """
-    Expected input:
-    {
-      "input": {
-        "image": "<base64>",
-        "prompt": "...",
-        "strength": 0.0-1.0,
-        "steps": int,
-        "guidance_scale": float,
-        "lora_scale": float,
-        "seed": int
-      }
-    }
-    """
     inp = event.get("input") or {}
 
     prompt = str(inp.get("prompt", ""))
 
-    # REQUIRED
     image_b64 = inp.get("image")
     if not image_b64:
         return {"error": "Missing base64 image"}
 
-    # SAFE DEFAULTS (help avoid black images)
-    strength = float(inp.get("strength", 0.08))  # low-strength refinement
-    strength = _clamp(strength, 0.02, 0.15)
+    # 🔥 FINAL FIX: SDXL cannot run below ~0.25
+    strength = float(inp.get("strength", 0.35))
+    strength = _clamp(strength, 0.25, 0.55)
 
-    steps = int(inp.get("steps", 12))
-    steps = max(5, min(steps, 20))
+    steps = int(inp.get("steps", 18))
+    steps = max(10, min(steps, 50))
 
-    guidance_scale = float(inp.get("guidance_scale", 1.5))
-    guidance_scale = _clamp(guidance_scale, 0.8, 3.0)
+    guidance_scale = float(inp.get("guidance_scale", 4.0))
+    guidance_scale = _clamp(guidance_scale, 1.0, 6.0)
 
     lora_scale = float(inp.get("lora_scale", 1.0))
     lora_scale = _clamp(lora_scale, 0.0, 2.0)
 
     seed = inp.get("seed")
 
-    # Decode input image
     try:
         img = decode_image(image_b64)
     except Exception as exc:
         return {"error": f"Failed to decode input image: {exc}"}
 
-    # 🔧 Fix size for SDXL (prevents 0-element tensor reshape)
     img = _fix_size(img)
 
-    # Init seed
     generator = None
     if seed is not None:
         try:
@@ -157,19 +126,12 @@ def handler(event: Dict[str, Any]):
         except Exception:
             generator = None
 
-    # Activate LoRA (if exists)
     if HAS_LORA:
         pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
 
-    # -------------------------------------------------------
-    # Inference
-    # -------------------------------------------------------
     try:
         autocast_dtype = torch.float16 if DEVICE == "cuda" else torch.bfloat16
-
-        with torch.inference_mode(), torch.autocast(
-            device_type=DEVICE, dtype=autocast_dtype
-        ):
+        with torch.inference_mode(), torch.autocast(device_type=DEVICE, dtype=autocast_dtype):
             result = pipe(
                 prompt=prompt,
                 image=img,
@@ -190,12 +152,11 @@ def handler(event: Dict[str, Any]):
                 "lora_scale": lora_scale,
                 "seed": seed,
                 "device": DEVICE,
-                "used_lora": HAS_LORA,
-            },
+                "used_lora": HAS_LORA
+            }
         }
 
     except Exception as exc:
-        # If something still goes wrong, you see the exact message in RunPod logs
         return {"error": f"Pipeline failed: {exc}"}
 
 
