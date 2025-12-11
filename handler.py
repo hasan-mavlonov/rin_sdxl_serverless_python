@@ -18,17 +18,18 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 print("Device:", DEVICE, "dtype:", DTYPE)
 
 # -------------------------------
-# LoRA paths
+# LoRA paths & adapter name
 # -------------------------------
 LORA_DIR = "/app/lora" if os.path.exists("/app/lora") else "lora"
 LORA_NAME = "rinxl_lora.safetensors"
+ADAPTER_NAME = "rinxl"
 
 lora_path = os.path.join(LORA_DIR, LORA_NAME)
 if not os.path.exists(lora_path):
     raise FileNotFoundError(f"LoRA missing: {lora_path}")
 
 # -------------------------------
-# Load SDXL Turbo + LoRA
+# Load SDXL Turbo + LoRA (dynamic adapters)
 # -------------------------------
 pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/sdxl-turbo",
@@ -36,18 +37,34 @@ pipe = AutoPipelineForImage2Image.from_pretrained(
     use_safetensors=True
 ).to(DEVICE)
 
-print(f"Loading LoRA from {lora_path}")
-pipe.load_lora_weights(LORA_DIR, weight_name=LORA_NAME)
-# fuse_lora makes it "baked in" (fast; cannot change scale later without reload)
-pipe.fuse_lora(lora_scale=1.0)
-print("LoRA loaded & fused.")
+print(f"Loading LoRA from {lora_path} with adapter '{ADAPTER_NAME}'")
+# Load LoRA as an adapter (NOT fused) so we can control lora_scale at runtime.
+pipe.load_lora_weights(
+    LORA_DIR,
+    weight_name=LORA_NAME,
+    adapter_name=ADAPTER_NAME,
+)
+
+# Enable adapter with default scale 1.0
+pipe.set_adapters([ADAPTER_NAME], adapter_weights=[1.0])
+print("LoRA loaded as dynamic adapter.")
 
 
 # -------------------------------
 # Helpers
 # -------------------------------
 def decode_image(b64: str) -> Image.Image:
-    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    raw = base64.b64decode(b64)
+    img = Image.open(io.BytesIO(raw))
+
+    # Fix for Gemini PNG with alpha → black artifacts
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        return bg.convert("RGB")
+
+    return img.convert("RGB")
+
 
 
 def encode_image(img: Image.Image) -> str:
@@ -56,10 +73,29 @@ def encode_image(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+
 # -------------------------------
 # Handler
 # -------------------------------
 def handler(event: Dict[str, Any]):
+    """
+    Expected input shape:
+
+    {
+      "input": {
+        "prompt": "text prompt",
+        "image": "<base64 PNG/JPEG>",
+        "strength": 0.35,          # optional, default 0.35
+        "steps": 4,                # optional, default 4
+        "guidance_scale": 0.0,     # optional, default 0.0 (Turbo-style)
+        "lora_scale": 1.0,         # optional, default 1.0
+        "seed": 123                # optional
+      }
+    }
+    """
     inp = event.get("input") or {}
 
     prompt: str = inp.get("prompt", "")
@@ -71,10 +107,30 @@ def handler(event: Dict[str, Any]):
         return {"error": "Missing base64 image in 'input.image'"}
 
     # SDXL Turbo is designed for very few steps, low guidance.
-    strength = float(inp.get("strength", 0.35))
-    steps = int(inp.get("steps", 4))  # 4 is usually plenty for Turbo
-    guidance_scale = float(inp.get("guidance_scale", 0.0))  # 0.0 recommended for Turbo
-    lora_scale = float(inp.get("lora_scale", 1.0))
+    try:
+        strength = float(inp.get("strength", 0.35))
+    except Exception:
+        strength = 0.35
+    strength = _clamp(strength, 0.0, 1.0)
+
+    try:
+        steps = int(inp.get("steps", 4))
+    except Exception:
+        steps = 4
+    steps = max(1, min(steps, 20))  # Turbo really doesn't need many steps
+
+    try:
+        guidance_scale = float(inp.get("guidance_scale", 0.0))
+    except Exception:
+        guidance_scale = 0.0
+
+    try:
+        lora_scale = float(inp.get("lora_scale", 1.0))
+    except Exception:
+        lora_scale = 1.0
+    # Reasonable range for LoRA influence
+    lora_scale = _clamp(lora_scale, 0.0, 2.0)
+
     seed = inp.get("seed")
 
     try:
@@ -88,15 +144,16 @@ def handler(event: Dict[str, Any]):
         try:
             generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
         except Exception:
-            pass
+            generator = None
 
     # Inference
     try:
-        # If you want dynamic lora_scale, you would need set_adapters instead of fuse_lora.
-        # With fuse_lora, this is fixed at load time (lora_scale above).
+        # Set LoRA adapter scale dynamically per request.
+        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
+
         with torch.inference_mode(), torch.autocast(
             device_type=DEVICE,
-            dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16
+            dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16,
         ):
             result = pipe(
                 prompt=prompt,
@@ -104,7 +161,7 @@ def handler(event: Dict[str, Any]):
                 strength=strength,
                 num_inference_steps=steps,
                 guidance_scale=guidance_scale,
-                generator=generator
+                generator=generator,
             )
 
         out_img = result.images[0]
@@ -117,6 +174,7 @@ def handler(event: Dict[str, Any]):
                 "lora_scale": lora_scale,
                 "seed": seed,
                 "device": DEVICE,
+                "adapter_name": ADAPTER_NAME,
             },
         }
     except Exception as e:
