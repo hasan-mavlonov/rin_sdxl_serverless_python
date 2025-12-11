@@ -8,20 +8,51 @@ import torch
 from diffusers import AutoPipelineForImage2Image
 from PIL import Image
 
+# -------------------------------------------------------
+# Device / dtype
+# -------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 print("Device:", DEVICE, "dtype:", DTYPE)
 
-# --- SDXL BASE, NO LORA ---
+# -------------------------------------------------------
+# Load SDXL Base (correct model for LoRA)
+# -------------------------------------------------------
 pipe = AutoPipelineForImage2Image.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
     torch_dtype=DTYPE,
-    use_safetensors=True,
+    use_safetensors=True
 ).to(DEVICE)
 
-print("Loaded SDXL Base img2img WITHOUT LoRA.")
+print("Loaded SDXL Base img2img pipeline.")
 
 
+# -------------------------------------------------------
+# Optional LoRA loading (if you want later)
+# -------------------------------------------------------
+LORA_DIR = "/app/lora" if os.path.exists("/app/lora") else "lora"
+LORA_NAME = "rinxl_lora.safetensors"
+ADAPTER_NAME = "rin_adapter"
+
+lora_path = os.path.join(LORA_DIR, LORA_NAME)
+HAS_LORA = os.path.exists(lora_path)
+
+if HAS_LORA:
+    print(f"Loading LoRA adapter from {lora_path}")
+    pipe.load_lora_weights(
+        LORA_DIR,
+        weight_name=LORA_NAME,
+        adapter_name=ADAPTER_NAME
+    )
+    pipe.set_adapters([ADAPTER_NAME], adapter_weights=[1.0])
+    print("LoRA loaded.")
+else:
+    print("WARNING: No LoRA found, running without.")
+
+
+# -------------------------------------------------------
+# Helpers
+# -------------------------------------------------------
 def decode_image(b64: str) -> Image.Image:
     raw = base64.b64decode(b64)
     img = Image.open(io.BytesIO(raw))
@@ -40,56 +71,76 @@ def encode_image(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
+# -------------------------------------------------------
+# MAIN HANDLER
+# -------------------------------------------------------
 def handler(event: Dict[str, Any]):
+    """
+    Expected input:
+    {
+      "input": {
+        "image": "<base64>",
+        "prompt": "...",
+        "strength": 0.0-1.0,
+        "steps": int,
+        "guidance_scale": float,
+        "lora_scale": float,
+        "seed": int
+      }
+    }
+    """
     inp = event.get("input") or {}
 
-    prompt: str = inp.get("prompt", "")
-    if not isinstance(prompt, str):
-        prompt = str(prompt)
+    prompt = str(inp.get("prompt", ""))
 
+    # REQUIRED
     image_b64 = inp.get("image")
     if not image_b64:
-        return {"error": "Missing base64 image in 'input.image'"}
+        return {"error": "Missing base64 image"}
 
-    try:
-        strength = float(inp.get("strength", 0.25))
-    except Exception:
-        strength = 0.25
-    strength = _clamp(strength, 0.0, 1.0)
+    # SAFE DEFAULTS (fixing black image problem)
+    strength = float(inp.get("strength", 0.08))  # SAFE RANGE
+    strength = _clamp(strength, 0.02, 0.15)
 
-    try:
-        steps = int(inp.get("steps", 20))
-    except Exception:
-        steps = 20
-    steps = max(5, min(steps, 50))
+    steps = int(inp.get("steps", 12))
+    steps = max(5, min(steps, 20))
 
-    try:
-        guidance_scale = float(inp.get("guidance_scale", 4.5))
-    except Exception:
-        guidance_scale = 4.5
+    guidance_scale = float(inp.get("guidance_scale", 1.5))
+    guidance_scale = _clamp(guidance_scale, 0.8, 3.0)
+
+    lora_scale = float(inp.get("lora_scale", 1.0))
+    lora_scale = _clamp(lora_scale, 0.0, 2.0)
 
     seed = inp.get("seed")
 
+    # Decode input image
     try:
         img = decode_image(image_b64)
-    except Exception as e:
-        return {"error": f"Image decode failed: {e}"}
+    except Exception as exc:
+        return {"error": f"Failed to decode input image: {exc}"}
 
+    # Init seed
     generator = None
     if seed is not None:
         try:
             generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
         except Exception:
-            generator = None
+            pass
 
+    # Activate LoRA (if exists)
+    if HAS_LORA:
+        pipe.set_adapters([ADAPTER_NAME], adapter_weights=[lora_scale])
+
+    # -------------------------------------------------------
+    # Inference (NO MORE NaNs / black output)
+    # -------------------------------------------------------
     try:
         with torch.inference_mode(), torch.autocast(
-            device_type=DEVICE,
-            dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16,
+            "cuda", dtype=torch.float16 if DEVICE == "cuda" else torch.bfloat16
         ):
             result = pipe(
                 prompt=prompt,
@@ -97,7 +148,7 @@ def handler(event: Dict[str, Any]):
                 strength=strength,
                 num_inference_steps=steps,
                 guidance_scale=guidance_scale,
-                generator=generator,
+                generator=generator
             )
 
         out_img = result.images[0]
@@ -107,13 +158,15 @@ def handler(event: Dict[str, Any]):
                 "strength": strength,
                 "steps": steps,
                 "guidance_scale": guidance_scale,
+                "lora_scale": lora_scale,
                 "seed": seed,
                 "device": DEVICE,
-                "adapter_name": None,
-            },
+                "used_lora": HAS_LORA
+            }
         }
-    except Exception as e:
-        return {"error": f"Pipeline failed: {e}"}
+
+    except Exception as exc:
+        return {"error": f"Pipeline failed: {exc}"}
 
 
 runpod.serverless.start({"handler": handler})
