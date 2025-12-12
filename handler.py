@@ -120,7 +120,9 @@ def _safe_generator(seed: Optional[int]) -> Optional[torch.Generator]:
 def _nan_check_callback(pipe, step, timestep, callback_kwargs):
     latents = callback_kwargs.get("latents")
     if latents is not None and not torch.isfinite(latents).all():
-        raise ValueError("Non-finite values detected in latents during diffusion")
+        _log("Non-finite latents detected; sanitizing values to continue diffusion.")
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+        callback_kwargs["latents"] = latents
     return callback_kwargs
 
 
